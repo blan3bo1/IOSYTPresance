@@ -1,0 +1,9 @@
+Package: com.blan3bo1.iosytpresence
+Name: iOS YouTube Presence
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: Discord Rich Presence for YouTube iOS - Inject with eSign
+Maintainer: blan3bo1
+Author: blan3bo1
+Section: Tweaks
+Depends: firmware (>= 13.0)
