@@ -1,0 +1,176 @@
+#import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
+#import <objc/runtime.h>
+
+__attribute__((constructor)) static void entry() {
+    NSLog(@"[IOSYTPresence] Tweak loaded successfully!");
+    
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2.0 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        [[NSClassFromString(@"IOSYTPresenceManager") shared] setup];
+    });
+}
+
+@interface IOSYTPresenceManager : NSObject
+@property (nonatomic, strong) NSTimer *updateTimer;
+@property (nonatomic, strong) NSDictionary *currentVideo;
++ (instancetype)shared;
+- (void)setup;
+- (void)updatePresence;
+- (void)sendToDiscord:(NSDictionary *)data;
+@end
+
+@implementation IOSYTPresenceManager
+
++ (instancetype)shared {
+    static IOSYTPresenceManager *shared = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        shared = [[self alloc] init];
+    });
+    return shared;
+}
+
+- (void)setup {
+    NSLog(@"[IOSYTPresence] Setting up Discord RPC");
+    self.updateTimer = [NSTimer scheduledTimerWithTimeInterval:3.0
+                                                       target:self
+                                                     selector:@selector(updatePresence)
+                                                     userInfo:nil
+                                                      repeats:YES];
+}
+
+- (void)updatePresence {
+    UIViewController *rootVC = [UIApplication sharedApplication].keyWindow.rootViewController;
+    id playerVC = [self findPlayerViewController:rootVC];
+    
+    if (playerVC) {
+        [self extractVideoInfoFromPlayer:playerVC];
+    } else {
+        [self clearPresence];
+    }
+}
+
+- (id)findPlayerViewController:(UIViewController *)vc {
+    if ([vc isKindOfClass:NSClassFromString(@"YTMainAppVideoPlayer")] ||
+        [vc isKindOfClass:NSClassFromString(@"YTPlayerViewController")]) {
+        return vc;
+    }
+    
+    for (UIViewController *child in vc.childViewControllers) {
+        id result = [self findPlayerViewController:child];
+        if (result) return result;
+    }
+    
+    return nil;
+}
+
+- (void)extractVideoInfoFromPlayer:(id)playerVC {
+    @try {
+        id playerResponse = [playerVC valueForKey:@"playerResponse"];
+        id video = [playerResponse valueForKey:@"video"];
+        
+        if (video) {
+            NSString *title = [video valueForKey:@"title"];
+            NSString *channel = [video valueForKey:@"channelTitle"];
+            NSNumber *duration = [video valueForKey:@"durationSeconds"];
+            NSNumber *currentTime = [playerVC valueForKey:@"currentTime"];
+            NSNumber *isPlaying = [playerVC valueForKey:@"isPlaying"];
+            
+            if (title && channel) {
+                NSDictionary *newVideo = @{
+                    @"title": title,
+                    @"channel": channel,
+                    @"duration": duration ?: @0,
+                    @"currentTime": currentTime ?: @0,
+                    @"isPlaying": isPlaying ?: @NO
+                };
+                
+                if (![newVideo isEqual:self.currentVideo]) {
+                    self.currentVideo = newVideo;
+                    [self updateDiscordWithVideo:newVideo];
+                }
+                return;
+            }
+        }
+    } @catch (NSException *exception) {
+        NSLog(@"[IOSYTPresence] Error extracting video info: %@", exception);
+    }
+    
+    [self updateDiscordWithVideo:@{@"title": @"Browsing YouTube", @"isPlaying": @NO}];
+}
+
+- (void)updateDiscordWithVideo:(NSDictionary *)video {
+    NSString *title = video[@"title"];
+    NSString *channel = video[@"channel"];
+    double duration = [video[@"duration"] doubleValue];
+    double currentTime = [video[@"currentTime"] doubleValue];
+    BOOL isPlaying = [video[@"isPlaying"] boolValue];
+    
+    NSMutableDictionary *activity = [NSMutableDictionary dictionary];
+    activity[@"details"] = title;
+    
+    if (channel) {
+        activity[@"state"] = [NSString stringWithFormat:@"By %@", channel];
+    }
+    
+    activity[@"assets"] = @{
+        @"large_image": @"youtube",
+        @"large_text": @"YouTube iOS",
+        @"small_image": isPlaying ? @"play" : @"pause",
+        @"small_text": isPlaying ? @"Playing" : @"Paused"
+    };
+    
+    if (duration > 0 && currentTime > 0) {
+        long startTime = (long)[[NSDate date] timeIntervalSince1970] - currentTime;
+        activity[@"timestamps"] = @{@"start": @(startTime)};
+        
+        if (isPlaying) {
+            activity[@"timestamps"] = @{
+                @"start": @(startTime),
+                @"end": @(startTime + duration)
+            };
+        }
+    }
+    
+    NSDictionary *rpcData = @{
+        @"cmd": @"SET_ACTIVITY",
+        @"args": @{
+            @"pid": @(getpid()),
+            @"activity": activity
+        }
+    };
+    
+    [self sendToDiscord:rpcData];
+}
+
+- (void)sendToDiscord:(NSDictionary *)data {
+    for (int i = 0; i < 10; i++) {
+        NSString *portName = [NSString stringWithFormat:@"discord-ipc-%d", i];
+        CFMessagePortRef port = CFMessagePortCreateRemote(kCFAllocatorDefault, (__bridge CFStringRef)portName);
+        
+        if (port) {
+            NSError *error;
+            NSData *jsonData = [NSJSONSerialization dataWithJSONObject:data options:0 error:&error];
+            
+            if (jsonData && !error) {
+                CFDataRef cfData = CFDataCreate(kCFAllocatorDefault, [jsonData bytes], [jsonData length]);
+                CFMessagePortSendRequest(port, 0, cfData, 1.0, 1.0, NULL, NULL);
+                CFRelease(cfData);
+            }
+            
+            CFRelease(port);
+            break;
+        }
+    }
+}
+
+- (void)clearPresence {
+    NSDictionary *clearData = @{
+        @"cmd": @"SET_ACTIVITY",
+        @"args": @{}
+    };
+    [self sendToDiscord:clearData];
+    self.currentVideo = nil;
+}
+
+@end
